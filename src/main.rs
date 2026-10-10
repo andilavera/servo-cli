@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -6,16 +6,32 @@ use std::time::{Duration, Instant};
 use dpi::PhysicalSize;
 use servo::accesskit::{Node, NodeId, Role, TreeId, TreeUpdate};
 use servo::{
-    JSValue, Preferences, RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext, WebView,
-    WebViewBuilder, WebViewDelegate,
+    JSValue, LoadStatus, Preferences, RenderingContext, Servo, ServoBuilder,
+    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
 };
 use sha2::{Digest, Sha256};
 use url::Url;
 
+const USAGE: &str = "\
+usage: servo-cli --url <url> (--html | --md | --accessibility-tree)
+
+  --url <url>            page to load
+  --html                 print the rendered HTML
+  --md                   print the page as Markdown
+  --accessibility-tree   print the page's accessibility tree";
+
 type Nodes = HashMap<(TreeId, NodeId), Node>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Html,
+    Markdown,
+    AccessibilityTree,
+}
 
 #[derive(Default)]
 struct Delegate {
+    completes: Cell<u64>,
     nodes: RefCell<Nodes>,
     doc: RefCell<Option<(TreeId, NodeId)>>,
     webview_tree: RefCell<Option<TreeId>>,
@@ -24,6 +40,12 @@ struct Delegate {
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, webview: WebView) {
         webview.paint();
+    }
+
+    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        if status == LoadStatus::Complete {
+            self.completes.set(self.completes.get() + 1);
+        }
     }
 
     fn notify_accessibility_tree_update(&self, _webview: WebView, update: TreeUpdate) {
@@ -40,8 +62,7 @@ impl WebViewDelegate for Delegate {
 }
 
 fn main() {
-    let target = std::env::args().nth(1).expect("usage: servo-cli <url>");
-    let url = Url::parse(&target).expect("invalid url");
+    let (url, mode) = parse_args();
 
     let rendering_context: Rc<dyn RenderingContext> =
         Rc::new(SoftwareRenderingContext::new(PhysicalSize::new(1024, 768)).expect("context"));
@@ -50,7 +71,7 @@ fn main() {
     let mut prefs = Preferences::default();
     prefs.network_http_proxy_uri = proxy("http_proxy");
     prefs.network_https_proxy_uri = proxy("https_proxy");
-    prefs.accessibility_enabled = true;
+    prefs.accessibility_enabled = mode == Mode::AccessibilityTree;
     let servo = ServoBuilder::default().preferences(prefs).build();
 
     let delegate = Rc::new(Delegate::default());
@@ -58,21 +79,88 @@ fn main() {
         .url(url)
         .delegate(delegate.clone())
         .build();
-    *delegate.webview_tree.borrow_mut() = webview.set_accessibility_active(true);
-
-    spin(&servo, || ready(&delegate));
-    if let Some(pass) = anubis_pass(&servo, &webview) {
-        let challenge = delegate.doc.borrow().map(|(tree, _)| tree);
-        webview.load(pass);
-        spin(&servo, || {
-            (*delegate.doc.borrow()).is_some_and(|(tree, _)| Some(tree) != challenge)
-        });
+    if mode == Mode::AccessibilityTree {
+        *delegate.webview_tree.borrow_mut() = webview.set_accessibility_active(true);
     }
 
-    let (tree, root) = (*delegate.doc.borrow()).expect("document accessibility tree");
-    let nodes = delegate.nodes.borrow();
-    let root = find_root_web_area(&nodes, tree, root).unwrap_or(root);
-    print_tree(&nodes, tree, root, 0);
+    spin(&servo, || webview.load_status() == LoadStatus::Complete);
+    if let Some(pass) = anubis_pass(&servo, &webview) {
+        let loaded = delegate.completes.get();
+        webview.load(pass);
+        spin(&servo, || delegate.completes.get() > loaded);
+    }
+
+    match mode {
+        Mode::Html => println!("{}", document_html(&servo, &webview).expect("page html")),
+        Mode::Markdown => {
+            let html = content_html(&servo, &webview).expect("page html");
+            println!("{}", html2md::parse_html(&html));
+        }
+        Mode::AccessibilityTree => {
+            spin(&servo, || ready(&delegate));
+            let nodes = delegate.nodes.borrow();
+            let (tree, root) = (*delegate.doc.borrow()).expect("document accessibility tree");
+            let root = find_root_web_area(&nodes, tree, root).unwrap_or(root);
+            print_tree(&nodes, tree, root, 0);
+        }
+    }
+}
+
+fn parse_args() -> (Url, Mode) {
+    let mut url = None;
+    let mut mode = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => url = args.next().as_deref().and_then(parse_url),
+            "--html" => choose(&mut mode, Mode::Html),
+            "--md" => choose(&mut mode, Mode::Markdown),
+            "--accessibility-tree" => choose(&mut mode, Mode::AccessibilityTree),
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            _ => usage(),
+        }
+    }
+    match (url, mode) {
+        (Some(url), Some(mode)) => (url, mode),
+        _ => usage(),
+    }
+}
+
+/// Record `value` as the mode, or bail out with usage if one is already set.
+fn choose(mode: &mut Option<Mode>, value: Mode) {
+    if mode.is_some() {
+        usage();
+    }
+    *mode = Some(value);
+}
+
+fn parse_url(s: &str) -> Option<Url> {
+    Url::parse(s)
+        .or_else(|_| Url::parse(&format!("https://{s}")))
+        .ok()
+}
+
+fn usage() -> ! {
+    eprintln!("{USAGE}");
+    std::process::exit(2);
+}
+
+/// Return the page's serialized document with the effects of scripts applied.
+fn document_html(servo: &Servo, webview: &WebView) -> Option<String> {
+    eval_string(servo, webview, "document.documentElement.outerHTML")
+}
+
+/// Return the body HTML with the effects of scripts applied, minus non-content elements.
+fn content_html(servo: &Servo, webview: &WebView) -> Option<String> {
+    const SCRIPT: &str = "(() => {
+        const root = (document.body ?? document.documentElement).cloneNode(true);
+        root.querySelectorAll('script,style,noscript,template').forEach(n => n.remove());
+        return root.outerHTML;
+    })()";
+    eval_string(servo, webview, SCRIPT)
 }
 
 /// Return the URL that solves the page's Anubis proof-of-work challenge, if it is one.
@@ -84,9 +172,7 @@ fn anubis_pass(servo: &Servo, webview: &WebView) -> Option<Url> {
         const {challenge, rules} = JSON.parse(c.textContent);
         return JSON.stringify({base: b ? JSON.parse(b.textContent) : '', url: location.href, challenge, rules});
     })()";
-    let JSValue::String(json) = eval(servo, webview, SCRIPT)? else {
-        return None;
-    };
+    let json = eval_string(servo, webview, SCRIPT)?;
     if json == "null" {
         return None;
     }
@@ -139,6 +225,13 @@ fn eval(servo: &Servo, webview: &WebView, script: &str) -> Option<JSValue> {
     });
     spin(servo, || slot.borrow().is_some());
     slot.borrow_mut().take().and_then(Result::ok)
+}
+
+fn eval_string(servo: &Servo, webview: &WebView, script: &str) -> Option<String> {
+    let JSValue::String(value) = eval(servo, webview, script)? else {
+        return None;
+    };
+    Some(value)
 }
 
 fn ready(delegate: &Delegate) -> bool {
